@@ -1,7 +1,7 @@
 -- Configuration & Settings
-local SKILL_INTERVAL = 0.15 -- Tốc độ spam phím M1, 1, 2, 3, 4 (giây)
-local G_INTERVAL = 120      -- Thời gian chờ cho phím G (120 giây = 2 phút)
-local MIN_PLAYERS = 4       -- Ngưỡng người chơi tối thiểu để đổi server
+local SKILL_INTERVAL = 0.1 -- Tốc độ spam phím (giây)
+local G_INTERVAL = 120     -- Thời gian chờ cho phím G (120 giây = 2 phút)
+local MIN_PLAYERS = 4      -- Ngưỡng người chơi tối thiểu để đổi server
 
 -- Services
 local Players = game:GetService("Players")
@@ -9,7 +9,6 @@ local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local targetPlayer = nil
@@ -240,7 +239,6 @@ local timeValueLabel = createStatCard(1, "⏱", "TIME", "Time")
 local killValueLabel = createStatCard(2, "☠", "KILLS", "Kill")
 local moneyValueLabel = createStatCard(3, "$", "MONEY", "Money")
 
--- Cập nhật thông số dữ liệu UI liên tục
 local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
 
 RunService.Heartbeat:Connect(function(dt)
@@ -264,12 +262,29 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 -------------------------------------------------
--- 2. AUTO FARM & TARGETING LOGIC
+-- 2. FIX SPAM ATTACK LOGIC
 -------------------------------------------------
+-- Hàm giả lập bấm phím an toàn cho Roblox
 local function pressKey(keyCode)
     VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-    task.wait(0.02)
+    task.wait(0.01)
     VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+end
+
+-- Hàm giả lập Click M1 trực tiếp bằng Mouse
+local function clickM1()
+    -- Tự động nhấp chuột trái vào giữa màn hình
+    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+    task.wait(0.01)
+    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+    
+    -- Nếu nhân vật đang cầm vũ khí/chiêu dạng Tool, kích hoạt trực tiếp
+    if LocalPlayer.Character then
+        local tool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool then
+            tool:Activate()
+        end
+    end
 end
 
 local function getNearestPlayer()
@@ -322,7 +337,7 @@ local function hopToCrowdedServer()
     end
 end
 
--- Task 1: Tự động quét và hop server khi ít người
+-- Task 1: Tự động đổi server khi dưới ngưỡng người chơi
 task.spawn(function()
     while task.wait(5) do
         if #Players:GetPlayers() <= MIN_PLAYERS then
@@ -332,7 +347,7 @@ task.spawn(function()
     end
 end)
 
--- Task 2: Lock 99% đằng sau lưng mục tiêu
+-- Task 2: Teleport và khóa góc nhìn vào mục tiêu
 RunService.Heartbeat:Connect(function()
     if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     
@@ -342,14 +357,14 @@ RunService.Heartbeat:Connect(function()
 
     if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
         local targetRoot = targetPlayer.Character.HumanoidRootPart
-        LocalPlayer.Character.HumanoidRootPart.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
+        -- Bám sát ngay sau lưng mục tiêu
+        LocalPlayer.Character.HumanoidRootPart.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 2.5)
     end
 end)
 
--- Task 3: Auto Spam Skill M1, 1, 2, 3, 4
+-- Task 3: Đã Sửa Lỗi Spam M1, 1, 2, 3, 4
 task.spawn(function()
-    local attackKeys = {
-        Enum.KeyCode.Button1,
+    local skillKeys = {
         Enum.KeyCode.One,
         Enum.KeyCode.Two,
         Enum.KeyCode.Three,
@@ -357,10 +372,14 @@ task.spawn(function()
     }
     
     while task.wait(SKILL_INTERVAL) do
-        if targetPlayer then
-            for _, key in ipairs(attackKeys) do
+        if targetPlayer and LocalPlayer.Character then
+            -- 1. Click M1
+            clickM1()
+            
+            -- 2. Spam lần lượt các chiêu 1, 2, 3, 4
+            for _, key in ipairs(skillKeys) do
                 pressKey(key)
-                task.wait(0.02)
+                task.wait(0.01)
             end
         end
     end
