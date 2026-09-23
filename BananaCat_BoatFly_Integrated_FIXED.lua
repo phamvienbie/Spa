@@ -642,35 +642,40 @@ local function MoveBoat(Position, Direction)
     local Target = CFrame.lookAt(Position, Position + Direction, Vector3.yAxis)
     local Moved = false
 
-    -- Primary method: move the entire model every Heartbeat.
+    -- Force the vehicle seat and the whole boat to the target CFrame.
+    -- CFrame is used as the primary movement method; velocity alone can be
+    -- cancelled by the boat's physics controller.
+    pcall(function()
+        if Seat and Seat.Parent then
+            local SeatOffset = Boat:GetPivot():ToObjectSpace(Seat.CFrame)
+            Seat.CFrame = Target * SeatOffset
+        end
+    end)
+
     pcall(function()
         Boat:PivotTo(Target)
         Moved = true
     end)
 
-    -- Fallback for boats whose PivotTo is not effective.
+    -- Directly move the primary part as an additional fallback.
     if Boat.PrimaryPart then
         pcall(function()
-            Boat:SetPrimaryPartCFrame(Target)
-            local Velocity = Direction * Config.Speed
-            if Config.LockAltitude then
-                Velocity = Vector3.new(Velocity.X, 0, Velocity.Z)
-            end
-            Boat.PrimaryPart.AssemblyLinearVelocity = Velocity
+            Boat.PrimaryPart.CFrame = Target
+            Boat.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+            Boat.PrimaryPart.AssemblyAngularVelocity = Vector3.zero
             Moved = true
         end)
     end
 
-    -- Keep unanchored parts moving in the same direction.
+    -- Keep the rest of the boat aligned with the model instead of relying on
+    -- physics to carry it. This also prevents the hull from drifting away.
     for _, Part in ipairs(Boat:GetDescendants()) do
-        if Part:IsA("BasePart") and not Part.Anchored then
+        if Part:IsA("BasePart") then
             pcall(function()
-                local Velocity = Direction * Config.Speed
-                if Config.LockAltitude then
-                    Velocity = Vector3.new(Velocity.X, 0, Velocity.Z)
+                if not Part.Anchored then
+                    Part.AssemblyLinearVelocity = Vector3.zero
+                    Part.AssemblyAngularVelocity = Vector3.zero
                 end
-                Part.AssemblyLinearVelocity = Velocity
-                Part.AssemblyAngularVelocity = Vector3.zero
             end)
         end
     end
@@ -703,38 +708,50 @@ end
 local function DetectObstacle(Position, Direction)
     if not Config.DodgeEnabled then return false end
 
+    local Forward = Direction.Unit
     local Params = RaycastParams.new()
     Params.FilterType = Enum.RaycastFilterType.Exclude
     Params.FilterDescendantsInstances = {Boat, Player.Character}
     Params.IgnoreWater = true
 
-    local Forward = Direction.Unit
-    local Right = Vector3.new(-Forward.Z, 0, Forward.X)
+    -- Scan the whole forward corridor up to 500 studs, not only one ray.
     local Length = Config.DodgeDistance
     local Radius = Config.DodgeRadius
+    local Right = Vector3.new(-Forward.Z, 0, Forward.X)
+    local Up = Vector3.yAxis
 
-    -- Dense forward sweep: several vertical levels and lateral offsets.
-    local HeightOffsets = {-45,-30,-15,0,15,30,45,70,100}
-    local SideOffsets = {-60,-40,-20,0,20,40,60}
-    for _, Y in ipairs(HeightOffsets) do
-        for _, Side in ipairs(SideOffsets) do
-            local Origin = Position + Vector3.new(0,Y,0) + Right * Side
-            local Hit = Workspace:Spherecast(Origin, Radius, Forward * Length, Params)
-            if Hit and IsValidObstaclePart(Hit.Instance) then
-                return true
-            end
+    local origins = {
+        Position,
+        Position + Right * 35, Position - Right * 35,
+        Position + Right * 70, Position - Right * 70,
+        Position + Up * 35, Position - Up * 35,
+        Position + Up * 70, Position - Up * 70,
+        Position + Up * 120, Position - Up * 120,
+    }
+
+    for _, Origin in ipairs(origins) do
+        local Hit = Workspace:Spherecast(Origin, Radius, Forward * Length, Params)
+        if Hit and IsValidObstaclePart(Hit.Instance) then
+            return true
         end
     end
 
-    -- Broad box catches irregular/large rocks, islands, boats and NPC hitboxes.
+    -- Also detect large objects anywhere inside the 500-stud forward box.
     local Center = Position + Forward * (Length * 0.5)
-    local BoxCFrame = CFrame.lookAt(Center, Center + Forward, Vector3.yAxis)
-    local Parts = Workspace:GetPartBoundsInBox(BoxCFrame, Vector3.new(180, 260, Length), Params)
+    local BoxCFrame = CFrame.lookAt(Center, Center + Forward, Up)
+    local Parts = Workspace:GetPartBoundsInBox(
+        BoxCFrame,
+        Vector3.new(220, 320, Length),
+        Params
+    )
+
     for _, Part in ipairs(Parts) do
         if IsValidObstaclePart(Part) then
             local Rel = Part.Position - Position
             local F = Rel:Dot(Forward)
-            if F >= 0 and F <= Length then
+            local Side = math.abs(Rel:Dot(Right))
+            local Height = math.abs(Rel.Y)
+            if F >= 0 and F <= Length and Side <= 120 and Height <= 170 then
                 return true
             end
         end
@@ -749,7 +766,7 @@ local function StartFlightFromCurrentPosition()
         return
     end
     if not StartY then
-        StartY = Position.Y - Config.Height
+        StartY = Position.Y + Config.Height
         HighY = StartY + Config.HighHeight
         Phase = 4
         HighStartPosition = nil
@@ -897,7 +914,7 @@ local function StartBoatFly()
         -- If something is detected in front, immediately switch to the 300-stud
         -- avoidance climb before continuing forward.
         if Phase == 4 and DetectObstacle(Position, Direction) then
-            StartY = Position.Y - Config.Height
+            StartY = Position.Y
             HighY = StartY + Config.HighHeight
             HighStartPosition = nil
             HighHoldStarted = 0
