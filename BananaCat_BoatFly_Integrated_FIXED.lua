@@ -350,6 +350,10 @@ tick();
     Title = "Tab Devil Fruit",
     Icon = ""
   }),
+    TabBoatFly = Window:AddTab({
+    Title = "Boat Fly",
+    Icon = ""
+  }),
     WebhookTab = Window:AddTab({
     Title = Translate("Tab Webhook"),
     Icon = ""
@@ -558,6 +562,53 @@ getgenv().BoatFly = getgenv().BoatFly or {
 
 local Config = getgenv().BoatFly
 
+-- Forward declaration so the Boat Fly UI can be created immediately.
+local SitBoat
+
+--------------------------------------------------
+-- BOAT FLY UI
+--------------------------------------------------
+
+if z.TabBoatFly then
+    z.TabBoatFly:AddButton({
+        Title = "Find Boat",
+        Description = "Tự tìm thuyền gần bạn và ngồi vào ghế.",
+        Callback = function()
+            task.spawn(function()
+                if SitBoat then
+                    SitBoat(true)
+                end
+            end)
+        end
+    })
+
+    z.TabBoatFly:AddToggle("BoatFlyEnabled", {
+        Title = "Boat Fly",
+        Description = "Bật/tắt Boat Fly.",
+        Default = Config.Enabled,
+        Callback = function(Value)
+            Config.Enabled = Value
+            if Value then
+                task.spawn(function()
+                    if SitBoat then
+                        SitBoat(true)
+                    end
+                end)
+            end
+        end
+    })
+
+    z.TabBoatFly:AddToggle("AutoFindBoat", {
+        Title = "Auto Find Boat",
+        Description = "Tự tìm và ngồi vào thuyền.",
+        Default = Config.AutoFindBoat,
+        Callback = function(Value)
+            Config.AutoFindBoat = Value
+            SaveSettings("AutoFindBoat", Value)
+        end
+    })
+end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
@@ -578,6 +629,7 @@ local LastDodge = 0
 local DodgeDirection = nil
 
 local Connection = nil
+
 
 
 --------------------------------------------------
@@ -917,9 +969,9 @@ end
 -- AUTO FIND + SIT
 --------------------------------------------------
 
-local function SitBoat()
+SitBoat = function(ForceFind)
 
-    if not Config.AutoFindBoat then
+    if not Config.AutoFindBoat and not ForceFind then
         return
     end
 
