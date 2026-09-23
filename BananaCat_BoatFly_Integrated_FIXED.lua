@@ -517,7 +517,7 @@ getgenv().caiconcac = toTarget;
 -- BOAT FLY - AUTO DODGE 300M (FIXED)
 -- ==================================================
 
-getgenv().BoatFly = getgenv().BoatFly or {
+getgenv().BoatFly = {
     Enabled = true,
     Speed = 300,
     Height = 50,
@@ -527,8 +527,9 @@ getgenv().BoatFly = getgenv().BoatFly or {
     DodgeEnabled = true,
     DodgeDistance = 500,
     DodgeRadius = 40,
-    DodgeCooldown = 0.08,
+    DodgeCooldown = 0,
     VerticalSpeed = 120,
+    LockAltitude = true,
     Direction = Vector3.new(-0.99102227, 0, -0.13369414),
     AutoFindBoat = true,
     AutoSit = true
@@ -635,32 +636,46 @@ end
 
 local function MoveBoat(Position, Direction)
     if not Boat or not Boat.Parent then
-        return
+        return false
     end
 
     local Target = CFrame.lookAt(Position, Position + Direction, Vector3.yAxis)
+    local Moved = false
 
-    -- Teleport/pivot every frame and also push physics velocity.  This is more
-    -- reliable for boats whose physics ownership changes while the player sits.
+    -- Primary method: move the entire model every Heartbeat.
     pcall(function()
         Boat:PivotTo(Target)
+        Moved = true
     end)
 
-    pcall(function()
-        if Boat.PrimaryPart then
-            Boat.PrimaryPart.CFrame = Target
-            Boat.PrimaryPart.AssemblyLinearVelocity = Direction * Config.Speed
-        end
-    end)
+    -- Fallback for boats whose PivotTo is not effective.
+    if Boat.PrimaryPart then
+        pcall(function()
+            Boat:SetPrimaryPartCFrame(Target)
+            local Velocity = Direction * Config.Speed
+            if Config.LockAltitude then
+                Velocity = Vector3.new(Velocity.X, 0, Velocity.Z)
+            end
+            Boat.PrimaryPart.AssemblyLinearVelocity = Velocity
+            Moved = true
+        end)
+    end
 
+    -- Keep unanchored parts moving in the same direction.
     for _, Part in ipairs(Boat:GetDescendants()) do
         if Part:IsA("BasePart") and not Part.Anchored then
             pcall(function()
-                Part.AssemblyLinearVelocity = Direction * Config.Speed
+                local Velocity = Direction * Config.Speed
+                if Config.LockAltitude then
+                    Velocity = Vector3.new(Velocity.X, 0, Velocity.Z)
+                end
+                Part.AssemblyLinearVelocity = Velocity
                 Part.AssemblyAngularVelocity = Vector3.zero
             end)
         end
     end
+
+    return Moved
 end
 
 local function IsValidObstaclePart(Part)
@@ -686,57 +701,40 @@ local function IsValidObstaclePart(Part)
 end
 
 local function DetectObstacle(Position, Direction)
-    if not Config.DodgeEnabled then
-        return false
-    end
-
-    -- Do not throttle detection heavily: the old 2-second cooldown could let
-    -- fast/small obstacles appear between checks. Only a tiny debounce remains.
-    if os.clock() - LastDodge < Config.DodgeCooldown then
-        return false
-    end
+    if not Config.DodgeEnabled then return false end
 
     local Params = RaycastParams.new()
     Params.FilterType = Enum.RaycastFilterType.Exclude
     Params.FilterDescendantsInstances = {Boat, Player.Character}
     Params.IgnoreWater = true
 
-    -- Check a 500-stud forward corridor at several heights.  The spherecasts
-    -- overlap so narrow rocks, terrain edges, ships and NPC hitboxes are much
-    -- less likely to slip through between two rays.
     local Forward = Direction.Unit
     local Right = Vector3.new(-Forward.Z, 0, Forward.X)
     local Length = Config.DodgeDistance
     local Radius = Config.DodgeRadius
-    local HeightOffsets = {-35, -20, -5, 10, 25, 40, 60, 80}
-    local SideOffsets = {-35, -18, 0, 18, 35}
 
+    -- Dense forward sweep: several vertical levels and lateral offsets.
+    local HeightOffsets = {-45,-30,-15,0,15,30,45,70,100}
+    local SideOffsets = {-60,-40,-20,0,20,40,60}
     for _, Y in ipairs(HeightOffsets) do
-        for _, SideAmount in ipairs(SideOffsets) do
-            local Origin = Position + Vector3.new(0, Y, 0) + Right * SideAmount
-            local Result = Workspace:Spherecast(Origin, Radius, Forward * Length, Params)
-            if Result and IsValidObstaclePart(Result.Instance) then
-                LastDodge = os.clock()
+        for _, Side in ipairs(SideOffsets) do
+            local Origin = Position + Vector3.new(0,Y,0) + Right * Side
+            local Hit = Workspace:Spherecast(Origin, Radius, Forward * Length, Params)
+            if Hit and IsValidObstaclePart(Hit.Instance) then
                 return true
             end
         end
     end
 
-    -- Also query the whole forward corridor. This catches large/irregular
-    -- objects whose geometry can be missed by a single cast.
-    local BoxCenter = Position + Forward * (Length * 0.5)
-    local BoxSize = Vector3.new(90, 180, Length)
-    local BoxCFrame = CFrame.lookAt(BoxCenter, BoxCenter + Forward, Vector3.yAxis)
-    local Parts = Workspace:GetPartBoundsInBox(BoxCFrame, BoxSize, Params)
+    -- Broad box catches irregular/large rocks, islands, boats and NPC hitboxes.
+    local Center = Position + Forward * (Length * 0.5)
+    local BoxCFrame = CFrame.lookAt(Center, Center + Forward, Vector3.yAxis)
+    local Parts = Workspace:GetPartBoundsInBox(BoxCFrame, Vector3.new(180, 260, Length), Params)
     for _, Part in ipairs(Parts) do
         if IsValidObstaclePart(Part) then
-            local Relative = Part.Position - Position
-            local ForwardDistance = Relative:Dot(Forward)
-            local SideDistance = math.abs(Relative:Dot(Right))
-            local VerticalDistance = math.abs(Relative.Y)
-            if ForwardDistance >= 0 and ForwardDistance <= Length
-                and SideDistance <= 60 and VerticalDistance <= 100 then
-                LastDodge = os.clock()
+            local Rel = Part.Position - Position
+            local F = Rel:Dot(Forward)
+            if F >= 0 and F <= Length then
                 return true
             end
         end
@@ -908,9 +906,18 @@ local function StartBoatFly()
         end
 
         if Phase == 4 then
+            -- Hard-lock normal cruising altitude while driving.
+            -- Horizontal movement continues at Speed; vertical physics is cancelled.
+            local LockedY = StartY + Config.Height
             local NewPosition = Position + Direction * Config.Speed * dt
-            NewPosition = Vector3.new(NewPosition.X, StartY + Config.Height, NewPosition.Z)
+            NewPosition = Vector3.new(NewPosition.X, LockedY, NewPosition.Z)
             MoveBoat(NewPosition, Direction)
+            if Config.LockAltitude and Boat.PrimaryPart then
+                pcall(function()
+                    local V = Boat.PrimaryPart.AssemblyLinearVelocity
+                    Boat.PrimaryPart.AssemblyLinearVelocity = Vector3.new(V.X, 0, V.Z)
+                end)
+            end
             return
         end
 
@@ -956,7 +963,7 @@ end
 StartBoatFly()
 
 task.spawn(function()
-    while task.wait(0.2) do
+    while task.wait(0.05) do
         if Config.Enabled and (not Boat or not Boat.Parent) then
             SitBoat(false)
         end
@@ -976,6 +983,21 @@ Player.CharacterAdded:Connect(function()
     ResetFlight()
     if Config.Enabled then
         SitBoat(true)
+    end
+end)
+
+-- Start immediately: find a boat, sit, and begin flight.
+task.spawn(function()
+    for _ = 1, 120 do
+        if Config.Enabled then
+            if Boat and Seat and Boat.Parent and Seat.Parent then
+                return
+            end
+            if SitBoat(true) then
+                return
+            end
+        end
+        task.wait(0.25)
     end
 end)
 
