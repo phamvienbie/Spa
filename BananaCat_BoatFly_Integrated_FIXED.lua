@@ -521,8 +521,9 @@ getgenv().BoatFly = getgenv().BoatFly or {
     Enabled = true,
     Speed = 150,
     Height = 15,
-    HighHeight = 300,
+    HighHeight = 1000,
     HighDistance = 250,
+    HighHoldTime = 5,
     DodgeEnabled = true,
     DodgeDistance = 180,
     DodgeRadius = 12,
@@ -546,6 +547,7 @@ local StartY = nil
 local HighY = nil
 local Phase = 4
 local HighStartPosition = nil
+local HighHoldStarted = 0
 local LastDodge = 0
 local DodgeDirection = nil
 local SitBoat
@@ -579,6 +581,7 @@ local function FindBoat()
 
     local Character = GetCharacter()
     local HRP = Character and Character:FindFirstChild("HumanoidRootPart")
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
     if not HRP then
         return nil, nil
     end
@@ -587,7 +590,8 @@ local function FindBoat()
 
     for _, Object in ipairs(BoatsFolder:GetDescendants()) do
         if Object:IsA("VehicleSeat") or Object:IsA("Seat") then
-            if not Object.Occupant then
+            local OccupiedByMe = Humanoid and Object.Occupant == Humanoid
+            if not Object.Occupant or OccupiedByMe then
                 local BoatModel = FindBoatModelFromSeat(Object, BoatsFolder)
                 if BoatModel then
                     local Distance = (Object.Position - HRP.Position).Magnitude
@@ -609,6 +613,7 @@ local function ResetFlight()
     HighY = nil
     Phase = 4
     HighStartPosition = nil
+    HighHoldStarted = 0
     DodgeDirection = nil
 end
 
@@ -633,25 +638,55 @@ local function MoveBoat(Position, Direction)
         return
     end
 
-    local CurrentPivot = Boat:GetPivot()
     local Target = CFrame.lookAt(Position, Position + Direction, Vector3.yAxis)
 
+    -- Teleport/pivot every frame and also push physics velocity.  This is more
+    -- reliable for boats whose physics ownership changes while the player sits.
     pcall(function()
         Boat:PivotTo(Target)
     end)
 
-    -- Giữ vận tốc theo hướng bay để physics/network ownership không kéo thuyền đứng lại.
+    pcall(function()
+        if Boat.PrimaryPart then
+            Boat.PrimaryPart.CFrame = Target
+            Boat.PrimaryPart.AssemblyLinearVelocity = Direction * Config.Speed
+        end
+    end)
+
     for _, Part in ipairs(Boat:GetDescendants()) do
         if Part:IsA("BasePart") and not Part.Anchored then
             pcall(function()
                 Part.AssemblyLinearVelocity = Direction * Config.Speed
+                Part.AssemblyAngularVelocity = Vector3.zero
             end)
         end
     end
 end
 
+local function IsValidObstaclePart(Part)
+    if not Part or not Part:IsA("BasePart") then
+        return false
+    end
+    if Part.Transparency >= 1 then
+        return false
+    end
+    if not Part.CanQuery then
+        return false
+    end
+    if Boat and Part:IsDescendantOf(Boat) then
+        return false
+    end
+    if Player.Character and Part:IsDescendantOf(Player.Character) then
+        return false
+    end
+    if Part:IsDescendantOf(Workspace:FindFirstChild("Camera")) then
+        return false
+    end
+    return true
+end
+
 local function DetectObstacle(Position, Direction)
-    if not Config.DodgeEnabled or Phase ~= 4 then
+    if not Config.DodgeEnabled then
         return false
     end
     if os.clock() - LastDodge < Config.DodgeCooldown then
@@ -663,17 +698,34 @@ local function DetectObstacle(Position, Direction)
     Params.FilterDescendantsInstances = {Boat, Player.Character}
     Params.IgnoreWater = true
 
-    local Result = Workspace:Spherecast(
-        Position + Vector3.new(0, 6, 0),
-        Config.DodgeRadius,
-        Direction * Config.DodgeDistance,
-        Params
-    )
-
-    if Result and Result.Instance and Result.Material ~= Enum.Material.Water then
-        LastDodge = os.clock()
-        return true
+    -- Check several heights and a wider sphere so rocks, islands and NPC/monster
+    -- hitboxes are detected even when their center is above/below the boat.
+    local Heights = {0, 6, 14, 24, 40}
+    for _, OffsetY in ipairs(Heights) do
+        local Origin = Position + Vector3.new(0, OffsetY, 0)
+        local Result = Workspace:Spherecast(
+            Origin,
+            Config.DodgeRadius,
+            Direction * Config.DodgeDistance,
+            Params
+        )
+        if Result and IsValidObstaclePart(Result.Instance) then
+            LastDodge = os.clock()
+            return true
+        end
     end
+
+    -- Extra rays slightly to either side catch narrow rocks/parts missed by the sphere.
+    local Side = Vector3.new(-Direction.Z, 0, Direction.X)
+    for _, Sign in ipairs({-1, 1}) do
+        local Origin = Position + Side * (Config.DodgeRadius * Sign)
+        local Result = Workspace:Raycast(Origin, Direction * Config.DodgeDistance, Params)
+        if Result and IsValidObstaclePart(Result.Instance) then
+            LastDodge = os.clock()
+            return true
+        end
+    end
+
     return false
 end
 
@@ -687,6 +739,7 @@ local function StartFlightFromCurrentPosition()
         HighY = StartY + Config.HighHeight
         Phase = 4
         HighStartPosition = nil
+        HighHoldStarted = 0
     end
 end
 
@@ -744,7 +797,7 @@ end
 if z.TabBoatFly then
     z.TabBoatFly:AddParagraph({
         Title = "Boat Fly",
-        Content = "Find Boat → ngồi vào thuyền → tự bay."
+        Content = "Find Boat → ngồi vào thuyền → né vật cản bằng cách bay lên 1000 studs, giữ độ cao 5 giây rồi hạ xuống."
     })
 
     z.TabBoatFly:AddButton({
@@ -813,6 +866,8 @@ local function StartBoatFly()
         if not Humanoid then return end
 
         if Seat.Occupant ~= Humanoid then
+            -- Try to re-seat instead of silently stopping.
+            pcall(function() Seat:Sit(Humanoid) end)
             return
         end
 
@@ -824,16 +879,19 @@ local function StartBoatFly()
         local Direction = GetDirection()
         if not Position or not Direction then return end
 
-        if Phase == 4 then
-            if DetectObstacle(Position, Direction) then
-                StartY = Position.Y - Config.Height
-                HighY = StartY + Config.HighHeight
-                HighStartPosition = nil
-                DodgeDirection = Direction
-                Phase = 1
-                return
-            end
+        -- Always keep the boat pointed in the configured direction.
+        -- If something is detected in front, immediately switch to the 300-stud
+        -- avoidance climb before continuing forward.
+        if Phase == 4 and DetectObstacle(Position, Direction) then
+            StartY = Position.Y - Config.Height
+            HighY = StartY + Config.HighHeight
+            HighStartPosition = nil
+            HighHoldStarted = 0
+            Phase = 1
+            return
+        end
 
+        if Phase == 4 then
             local NewPosition = Position + Direction * Config.Speed * dt
             NewPosition = Vector3.new(NewPosition.X, StartY + Config.Height, NewPosition.Z)
             MoveBoat(NewPosition, Direction)
@@ -841,27 +899,32 @@ local function StartBoatFly()
         end
 
         if Phase == 1 then
+            -- Rise straight up to the configured high altitude (default +300).
             local NewY, Finished = MoveTowardY(Position.Y, HighY, dt)
             MoveBoat(Vector3.new(Position.X, NewY, Position.Z), Direction)
             if Finished then
                 Phase = 2
                 HighStartPosition = Vector3.new(Position.X, HighY, Position.Z)
+                HighHoldStarted = os.clock()
             end
             return
         end
 
         if Phase == 2 then
+            -- Stay at the full 1000-stud avoidance height for 5 seconds,
+            -- while continuing to fly in the configured direction.
             local NewPosition = Position + Direction * Config.Speed * dt
             NewPosition = Vector3.new(NewPosition.X, HighY, NewPosition.Z)
             MoveBoat(NewPosition, Direction)
 
-            if HighStartPosition and (Vector3.new(NewPosition.X, 0, NewPosition.Z) - Vector3.new(HighStartPosition.X, 0, HighStartPosition.Z)).Magnitude >= Config.HighDistance then
+            if HighHoldStarted > 0 and (os.clock() - HighHoldStarted) >= Config.HighHoldTime then
                 Phase = 3
             end
             return
         end
 
         if Phase == 3 then
+            -- Descend while still following the configured direction.
             local TargetY = StartY + Config.Height
             local NewY, Finished = MoveTowardY(Position.Y, TargetY, dt)
             local NewPosition = Position + Direction * Config.Speed * dt
@@ -877,7 +940,7 @@ end
 StartBoatFly()
 
 task.spawn(function()
-    while task.wait(0.5) do
+    while task.wait(0.2) do
         if Config.Enabled and (not Boat or not Boat.Parent) then
             SitBoat(false)
         end
