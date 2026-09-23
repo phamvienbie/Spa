@@ -346,21 +346,13 @@ tick();
     Title = "Setting Hold \10 and Select Skill",
     Icon = ""
   }),
-    TabDevilFruit = Window:AddTab({
-    Title = "Tab Devil Fruit",
-    Icon = ""
-  }),
     TabBoatFly = Window:AddTab({
     Title = "Boat Fly",
-    Icon = ""
-  }),
-    WebhookTab = Window:AddTab({
-    Title = Translate("Tab Webhook"),
     Icon = ""
   })
 };
 getgenv().Options = Y.Options;
-Window:SelectTab(1);
+Window:SelectTab(z.TabBoatFly);
 local h = false;
     getgenv().IsPlayerDead = function () if not y.Character or not y.Character:FindFirstChild("Humanoid") or y.Character.Humanoid.Health == 0 then
     return true;
@@ -522,61 +514,247 @@ getgenv().caiconcac = toTarget;
 });
 
 -- ==================================================
--- BOAT FLY - AUTO DODGE 300M
+-- BOAT FLY - AUTO DODGE 300M (FIXED)
 -- ==================================================
-
---// Blox Fruits Boat Fly - Smooth Start
---// Sit -> Fly immediately
---// No extra teleport / no unnecessary waiting
---// Jump off = Pause
---// Sit back = Resume
 
 getgenv().BoatFly = getgenv().BoatFly or {
     Enabled = true,
-
     Speed = 150,
-
     Height = 15,
-
     HighHeight = 300,
-
     HighDistance = 250,
-
-    -- Auto Dodge
     DodgeEnabled = true,
     DodgeDistance = 180,
     DodgeRadius = 12,
     DodgeCooldown = 2,
-
-    VerticalSpeed = 100,
-
-    Direction = Vector3.new(
-        -0.99102227,
-        0,
-        -0.13369414
-    ),
-
+    VerticalSpeed = 120,
+    Direction = Vector3.new(-0.99102227, 0, -0.13369414),
     AutoFindBoat = true,
     AutoSit = true
 }
 
 local Config = getgenv().BoatFly
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Player = Players.LocalPlayer
 
--- Forward declaration so the Boat Fly UI can be created immediately.
+local Boat = nil
+local Seat = nil
+local Connection = nil
+local StartY = nil
+local HighY = nil
+local Phase = 4
+local HighStartPosition = nil
+local LastDodge = 0
+local DodgeDirection = nil
 local SitBoat
 
---------------------------------------------------
--- BOAT FLY UI
---------------------------------------------------
+local function GetCharacter()
+    return Player.Character or Player.CharacterAdded:Wait()
+end
 
+local function GetHumanoid()
+    local Character = GetCharacter()
+    return Character and Character:FindFirstChildOfClass("Humanoid")
+end
+
+local function FindBoatModelFromSeat(SeatObject, BoatsFolder)
+    local Current = SeatObject
+    local LastModel = nil
+    while Current and Current ~= BoatsFolder do
+        if Current:IsA("Model") then
+            LastModel = Current
+        end
+        Current = Current.Parent
+    end
+    return LastModel
+end
+
+local function FindBoat()
+    local BoatsFolder = Workspace:FindFirstChild("Boats")
+    if not BoatsFolder then
+        return nil, nil
+    end
+
+    local Character = GetCharacter()
+    local HRP = Character and Character:FindFirstChild("HumanoidRootPart")
+    if not HRP then
+        return nil, nil
+    end
+
+    local NearestBoat, NearestSeat, NearestDistance = nil, nil, math.huge
+
+    for _, Object in ipairs(BoatsFolder:GetDescendants()) do
+        if Object:IsA("VehicleSeat") or Object:IsA("Seat") then
+            if not Object.Occupant then
+                local BoatModel = FindBoatModelFromSeat(Object, BoatsFolder)
+                if BoatModel then
+                    local Distance = (Object.Position - HRP.Position).Magnitude
+                    if Distance < NearestDistance then
+                        NearestDistance = Distance
+                        NearestBoat = BoatModel
+                        NearestSeat = Object
+                    end
+                end
+            end
+        end
+    end
+
+    return NearestBoat, NearestSeat
+end
+
+local function ResetFlight()
+    StartY = nil
+    HighY = nil
+    Phase = 4
+    HighStartPosition = nil
+    DodgeDirection = nil
+end
+
+local function GetBoatPosition()
+    if not Boat or not Boat.Parent then
+        return nil
+    end
+    return Boat:GetPivot().Position
+end
+
+local function GetDirection()
+    local D = Config.Direction
+    D = Vector3.new(D.X, 0, D.Z)
+    if D.Magnitude < 0.01 then
+        return nil
+    end
+    return D.Unit
+end
+
+local function MoveBoat(Position, Direction)
+    if not Boat or not Boat.Parent then
+        return
+    end
+
+    local CurrentPivot = Boat:GetPivot()
+    local Target = CFrame.lookAt(Position, Position + Direction, Vector3.yAxis)
+
+    pcall(function()
+        Boat:PivotTo(Target)
+    end)
+
+    -- Giữ vận tốc theo hướng bay để physics/network ownership không kéo thuyền đứng lại.
+    for _, Part in ipairs(Boat:GetDescendants()) do
+        if Part:IsA("BasePart") and not Part.Anchored then
+            pcall(function()
+                Part.AssemblyLinearVelocity = Direction * Config.Speed
+            end)
+        end
+    end
+end
+
+local function DetectObstacle(Position, Direction)
+    if not Config.DodgeEnabled or Phase ~= 4 then
+        return false
+    end
+    if os.clock() - LastDodge < Config.DodgeCooldown then
+        return false
+    end
+
+    local Params = RaycastParams.new()
+    Params.FilterType = Enum.RaycastFilterType.Exclude
+    Params.FilterDescendantsInstances = {Boat, Player.Character}
+    Params.IgnoreWater = true
+
+    local Result = Workspace:Spherecast(
+        Position + Vector3.new(0, 6, 0),
+        Config.DodgeRadius,
+        Direction * Config.DodgeDistance,
+        Params
+    )
+
+    if Result and Result.Instance and Result.Material ~= Enum.Material.Water then
+        LastDodge = os.clock()
+        return true
+    end
+    return false
+end
+
+local function StartFlightFromCurrentPosition()
+    local Position = GetBoatPosition()
+    if not Position then
+        return
+    end
+    if not StartY then
+        StartY = Position.Y - Config.Height
+        HighY = StartY + Config.HighHeight
+        Phase = 4
+        HighStartPosition = nil
+    end
+end
+
+SitBoat = function(ForceFind)
+    if not Config.AutoFindBoat and not ForceFind then
+        return false
+    end
+
+    if Boat and Boat.Parent and Seat and Seat.Parent then
+        local Humanoid = GetHumanoid()
+        if Humanoid and Seat.Occupant ~= Humanoid then
+            pcall(function() Seat:Sit(Humanoid) end)
+        end
+        return true
+    end
+
+    local NewBoat, NewSeat = FindBoat()
+    if not NewBoat or not NewSeat then
+        return false
+    end
+
+    Boat = NewBoat
+    Seat = NewSeat
+    ResetFlight()
+
+    local Humanoid = GetHumanoid()
+    local HRP = GetCharacter():FindFirstChild("HumanoidRootPart")
+    if not Humanoid or not HRP then
+        return false
+    end
+
+    -- Đưa nhân vật tới ghế rồi Sit để Find Boat thực sự có tác dụng.
+    pcall(function()
+        HRP.CFrame = NewSeat.CFrame + Vector3.new(0, 3, 0)
+        task.wait(0.05)
+        NewSeat:Sit(Humanoid)
+    end)
+
+    task.spawn(function()
+        for _ = 1, 40 do
+            if not Boat or not Boat.Parent or not Seat or not Seat.Parent then
+                return
+            end
+            if Seat.Occupant == Humanoid then
+                StartFlightFromCurrentPosition()
+                return
+            end
+            task.wait(0.05)
+        end
+    end)
+    return true
+end
+
+-- Boat Fly UI
 if z.TabBoatFly then
+    z.TabBoatFly:AddParagraph({
+        Title = "Boat Fly",
+        Content = "Find Boat → ngồi vào thuyền → tự bay."
+    })
+
     z.TabBoatFly:AddButton({
         Title = "Find Boat",
-        Description = "Tự tìm thuyền gần bạn và ngồi vào ghế.",
+        Description = "Tìm thuyền gần nhất và ngồi vào ghế.",
         Callback = function()
             task.spawn(function()
-                if SitBoat then
-                    SitBoat(true)
+                local Found = SitBoat(true)
+                if G and G.SetStatus then
+                    G.SetStatus(Found and "Đã tìm thấy thuyền" or "Không tìm thấy thuyền", Found and G.Colors.Green or G.Colors.Red)
                 end
             end)
         end
@@ -584,16 +762,12 @@ if z.TabBoatFly then
 
     z.TabBoatFly:AddToggle("BoatFlyEnabled", {
         Title = "Boat Fly",
-        Description = "Bật/tắt Boat Fly.",
+        Description = "Bật/tắt bay thuyền.",
         Default = Config.Enabled,
         Callback = function(Value)
             Config.Enabled = Value
             if Value then
-                task.spawn(function()
-                    if SitBoat then
-                        SitBoat(true)
-                    end
-                end)
+                task.spawn(function() SitBoat(true) end)
             end
         end
     })
@@ -609,782 +783,124 @@ if z.TabBoatFly then
     })
 end
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-
-local Player = Players.LocalPlayer
-
-local Boat = nil
-local Seat = nil
-
-local StartY = nil
-local HighY = nil
-
-local Phase = 0
-local HighStartPosition = nil
-
--- Auto dodge state
-local LastDodge = 0
-local DodgeDirection = nil
-
-local Connection = nil
-
-
-
---------------------------------------------------
--- CHARACTER
---------------------------------------------------
-
-local function GetCharacter()
-    return Player.Character
-        or Player.CharacterAdded:Wait()
-end
-
-local function GetHumanoid()
-    local Character = GetCharacter()
-
-    return Character:FindFirstChildOfClass(
-        "Humanoid"
-    )
-end
-
-
---------------------------------------------------
--- FIND SEAT
---------------------------------------------------
-
-local function FindSeat(Model)
-
-    if not Model then
-        return nil
-    end
-
-    local VehicleSeat =
-        Model:FindFirstChildWhichIsA(
-            "VehicleSeat",
-            true
-        )
-
-    if VehicleSeat then
-        return VehicleSeat
-    end
-
-    return Model:FindFirstChildWhichIsA(
-        "Seat",
-        true
-    )
-end
-
-
---------------------------------------------------
--- FIND BOAT
---------------------------------------------------
-
-local function FindBoat()
-
-    local BoatsFolder =
-        Workspace:FindFirstChild("Boats")
-
-    if not BoatsFolder then
-        return nil, nil
-    end
-
-    local Character = GetCharacter()
-
-    local HRP =
-        Character:FindFirstChild(
-            "HumanoidRootPart"
-        )
-
-    if not HRP then
-        return nil, nil
-    end
-
-    local NearestBoat = nil
-    local NearestSeat = nil
-    local NearestDistance = math.huge
-
-    for _, BoatModel in
-        ipairs(BoatsFolder:GetChildren()) do
-
-        if BoatModel:IsA("Model") then
-
-            local BoatSeat =
-                FindSeat(BoatModel)
-
-            if BoatSeat then
-
-                local Distance =
-                    (
-                        BoatSeat.Position
-                        - HRP.Position
-                    ).Magnitude
-
-                if Distance < NearestDistance then
-
-                    if not BoatSeat.Occupant then
-
-                        NearestDistance =
-                            Distance
-
-                        NearestBoat =
-                            BoatModel
-
-                        NearestSeat =
-                            BoatSeat
-                    end
-                end
-            end
-        end
-    end
-
-    return NearestBoat, NearestSeat
-end
-
-
---------------------------------------------------
--- RESET
---------------------------------------------------
-
-local function ResetFlight()
-
-    StartY = nil
-    HighY = nil
-
-    Phase = 0
-
-    HighStartPosition = nil
-
-    DodgeDirection = nil
-end
-
-
---------------------------------------------------
--- GET POSITION
---------------------------------------------------
-
-local function GetBoatPosition()
-
-    if not Boat
-        or not Boat.Parent then
-        return nil
-    end
-
-    if Boat.PrimaryPart then
-        return Boat.PrimaryPart.Position
-    end
-
-    if Seat
-        and Seat.Parent then
-        return Seat.Position
-    end
-
-    return nil
-end
-
-
---------------------------------------------------
--- DIRECTION
---------------------------------------------------
-
-local function GetDirection()
-
-    local Direction =
-        Config.Direction
-
-    Direction = Vector3.new(
-        Direction.X,
-        0,
-        Direction.Z
-    )
-
-    if Direction.Magnitude <= 0 then
-        return nil
-    end
-
-    return Direction.Unit
-end
-
-
---------------------------------------------------
--- AUTO DODGE DETECTION
--- Phát hiện đá / model sự kiện biển phía trước.
--- Không tính Water Terrain là vật cản.
---------------------------------------------------
-
-local function IsIgnoredHit(Instance)
-    if not Instance then
-        return true
-    end
-
-    if Boat and (Instance == Boat or Instance:IsDescendantOf(Boat)) then
-        return true
-    end
-
-    local Character = Player.Character
-
-    if Character and (Instance == Character or Instance:IsDescendantOf(Character)) then
-        return true
-    end
-
-    return false
-end
-
-local function DetectObstacle(Position, Direction)
-    if not Config.DodgeEnabled then
-        return false
-    end
-
-    if os.clock() - LastDodge < Config.DodgeCooldown then
-        return false
-    end
-
-    if Phase ~= 4 then
-        return false
-    end
-
-    local Params = RaycastParams.new()
-    Params.FilterType = Enum.RaycastFilterType.Exclude
-    Params.FilterDescendantsInstances = {
-        Boat,
-        Player.Character
-    }
-    Params.IgnoreWater = true
-
-    -- Spherecast rộng hơn Raycast để bắt đá/đảo/event nằm lệch nhẹ khỏi tâm.
-    local Result = Workspace:Spherecast(
-        Position + Vector3.new(0, 6, 0),
-        Config.DodgeRadius,
-        Direction * Config.DodgeDistance,
-        Params
-    )
-
-    if not Result or not Result.Instance then
-        return false
-    end
-
-    if IsIgnoredHit(Result.Instance) then
-        return false
-    end
-
-    -- Nếu engine trả về Water thì bỏ qua.
-    if Result.Material == Enum.Material.Water then
-        return false
-    end
-
-    LastDodge = os.clock()
-    return true
-end
-
-local function BeginDodge(Position)
-    StartY = Position.Y - Config.Height
-    HighY = StartY + Config.HighHeight
-    HighStartPosition = nil
-    DodgeDirection = GetDirection()
-    Phase = 1
-end
-
---------------------------------------------------
--- MOVE BOAT
---------------------------------------------------
-
-local function MoveBoat(
-    Position,
-    Direction
-)
-
-    if not Boat
-        or not Boat.Parent then
-        return
-    end
-
-    local TargetCFrame =
-        CFrame.lookAt(
-            Position,
-            Position + Direction,
-            Vector3.yAxis
-        )
-
-    if Boat.PrimaryPart then
-
-        Boat:PivotTo(
-            TargetCFrame
-        )
-
-    elseif Seat
-        and Seat.Parent then
-
-        Seat.CFrame =
-            TargetCFrame
-    end
-end
-
-
---------------------------------------------------
--- START FLIGHT FROM CURRENT POSITION
---------------------------------------------------
-
-local function StartFlightFromCurrentPosition()
-
-    if not Boat
-        or not Seat
-        or not Boat.Parent
-        or not Seat.Parent then
-
-        return
-    end
-
-    local Position =
-        GetBoatPosition()
-
-    if not Position then
-        return
-    end
-
-    --------------------------------------------------
-    -- Chỉ tạo StartY nếu là thuyền mới
-    --------------------------------------------------
-
-    if not StartY then
-
-        StartY = Position.Y
-
-        HighY =
-            StartY
-            + Config.HighHeight
-
-        Phase = 4
-
-        HighStartPosition = nil
-
-    elseif Phase == 0 then
-
-        Phase = 4
-    end
-end
-
-
---------------------------------------------------
--- AUTO FIND + SIT
---------------------------------------------------
-
-SitBoat = function(ForceFind)
-
-    if not Config.AutoFindBoat and not ForceFind then
-        return
-    end
-
-    if Boat
-        and Boat.Parent
-        and Seat
-        and Seat.Parent then
-
-        return
-    end
-
-    local NewBoat, NewSeat =
-        FindBoat()
-
-    if not NewBoat
-        or not NewSeat then
-
-        return
-    end
-
-    Boat = NewBoat
-    Seat = NewSeat
-
-    local Humanoid =
-        GetHumanoid()
-
-    if not Humanoid then
-        return
-    end
-
-    --------------------------------------------------
-    -- KHÔNG TELEPORT NHÂN VẬT
-    -- KHÔNG WAIT DÀI
-    --------------------------------------------------
-
-    Seat:Sit(Humanoid)
-
-    --------------------------------------------------
-    -- Kiểm tra liên tục cho tới khi thật sự ngồi
-    --------------------------------------------------
-
-    task.spawn(function()
-
-        for _ = 1, 20 do
-
-            if not Boat
-                or not Boat.Parent
-                or not Seat
-                or not Seat.Parent then
-
-                return
-            end
-
-            if Seat.Occupant == Humanoid then
-
-                -- Vừa ngồi xong -> bay ngay
-                StartFlightFromCurrentPosition()
-
-                return
-            end
-
-            task.wait(0.03)
-        end
-    end)
-end
-
-
---------------------------------------------------
--- MOVE TOWARD Y
---------------------------------------------------
-
-local function MoveTowardY(
-    CurrentY,
-    TargetY,
-    dt
-)
-
-    local Difference =
-        TargetY - CurrentY
-
-    local Step =
-        Config.VerticalSpeed * dt
-
+local function MoveTowardY(CurrentY, TargetY, dt)
+    local Difference = TargetY - CurrentY
+    local Step = Config.VerticalSpeed * dt
     if math.abs(Difference) <= Step then
-
         return TargetY, true
     end
-
-    if Difference > 0 then
-        return CurrentY + Step, false
-    else
-        return CurrentY - Step, false
-    end
+    return CurrentY + (Difference > 0 and Step or -Step), false
 end
 
-
---------------------------------------------------
--- BOAT FLY
---------------------------------------------------
-
 local function StartBoatFly()
-
     if Connection then
         Connection:Disconnect()
     end
 
-    Connection =
-        RunService.Heartbeat:Connect(
-            function(dt)
-
-                if not Config.Enabled then
-                    return
-                end
-
-                --------------------------------------------------
-                -- BOAT LOST
-                --------------------------------------------------
-
-                if not Boat
-                    or not Boat.Parent
-                    or not Seat
-                    or not Seat.Parent then
-
-                    Boat = nil
-                    Seat = nil
-
-                    ResetFlight()
-
-                    SitBoat()
-
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- HUMANOID
-                --------------------------------------------------
-
-                local Humanoid =
-                    GetHumanoid()
-
-                if not Humanoid then
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- KHÔNG NGỒI = PAUSE
-                --------------------------------------------------
-
-                if Seat.Occupant ~= Humanoid then
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- ĐẢM BẢO ĐÃ CÓ FLIGHT STATE
-                --------------------------------------------------
-
-                if not StartY then
-                    StartFlightFromCurrentPosition()
-                end
-
-
-                local Position =
-                    GetBoatPosition()
-
-                if not Position then
-                    return
-                end
-
-
-                local Direction =
-                    GetDirection()
-
-                if not Direction then
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- NORMAL FLIGHT + AUTO DODGE
-                -- Gặp đá / sea event -> bay lên 300 studs
-                --------------------------------------------------
-
-                if Phase == 4 then
-
-                    if DetectObstacle(Position, Direction) then
-                        BeginDodge(Position)
-                        return
-                    end
-
-                    local NewPosition =
-                        Position
-                        + Direction
-                        * Config.Speed
-                        * dt
-
-                    NewPosition = Vector3.new(
-                        NewPosition.X,
-                        StartY + Config.Height,
-                        NewPosition.Z
-                    )
-
-                    MoveBoat(NewPosition, Direction)
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- PHASE 1
-                -- NÉ: LÊN 300 STUDS
-                --------------------------------------------------
-
-                if Phase == 1 then
-
-                    local NewY, Finished =
-                        MoveTowardY(
-                            Position.Y,
-                            HighY,
-                            dt
-                        )
-
-                    local NewPosition =
-                        Vector3.new(
-                            Position.X,
-                            NewY,
-                            Position.Z
-                        )
-
-                    MoveBoat(
-                        NewPosition,
-                        Direction
-                    )
-
-                    if Finished then
-
-                        Phase = 2
-
-                        HighStartPosition =
-                            Vector3.new(
-                                NewPosition.X,
-                                HighY,
-                                NewPosition.Z
-                            )
-                    end
-
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- PHASE 2
-                -- BAY NGANG
-                --------------------------------------------------
-
-                if Phase == 2 then
-
-                    local NewPosition =
-                        Position
-                        + Direction
-                        * Config.Speed
-                        * dt
-
-                    NewPosition =
-                        Vector3.new(
-                            NewPosition.X,
-                            HighY,
-                            NewPosition.Z
-                        )
-
-                    MoveBoat(
-                        NewPosition,
-                        Direction
-                    )
-
-                    if HighStartPosition then
-
-                        local Distance =
-                            (
-                                Vector3.new(
-                                    NewPosition.X,
-                                    0,
-                                    NewPosition.Z
-                                )
-                                -
-                                Vector3.new(
-                                    HighStartPosition.X,
-                                    0,
-                                    HighStartPosition.Z
-                                )
-                            ).Magnitude
-
-                        if Distance >=
-                            Config.HighDistance then
-
-                            Phase = 3
-                        end
-                    end
-
-                    return
-                end
-
-
-                --------------------------------------------------
-                -- PHASE 3
-                -- HẠ XUỐNG 15
-                --------------------------------------------------
-
-                if Phase == 3 then
-
-                    local TargetY =
-                        StartY
-                        + Config.Height
-
-                    local NewY, Finished =
-                        MoveTowardY(
-                            Position.Y,
-                            TargetY,
-                            dt
-                        )
-
-                    local NewPosition =
-                        Position
-                        + Direction
-                        * Config.Speed
-                        * dt
-
-                    NewPosition =
-                        Vector3.new(
-                            NewPosition.X,
-                            NewY,
-                            NewPosition.Z
-                        )
-
-                    MoveBoat(
-                        NewPosition,
-                        Direction
-                    )
-
-                    if Finished then
-                        Phase = 4
-                    end
-
-                    return
-                end
-
-
-
+    Connection = RunService.Heartbeat:Connect(function(dt)
+        if not Config.Enabled then
+            return
+        end
+
+        if not Boat or not Boat.Parent or not Seat or not Seat.Parent then
+            Boat, Seat = nil, nil
+            ResetFlight()
+            SitBoat(false)
+            return
+        end
+
+        local Humanoid = GetHumanoid()
+        if not Humanoid then return end
+
+        if Seat.Occupant ~= Humanoid then
+            return
+        end
+
+        if not StartY then
+            StartFlightFromCurrentPosition()
+        end
+
+        local Position = GetBoatPosition()
+        local Direction = GetDirection()
+        if not Position or not Direction then return end
+
+        if Phase == 4 then
+            if DetectObstacle(Position, Direction) then
+                StartY = Position.Y - Config.Height
+                HighY = StartY + Config.HighHeight
+                HighStartPosition = nil
+                DodgeDirection = Direction
+                Phase = 1
+                return
             end
-        )
+
+            local NewPosition = Position + Direction * Config.Speed * dt
+            NewPosition = Vector3.new(NewPosition.X, StartY + Config.Height, NewPosition.Z)
+            MoveBoat(NewPosition, Direction)
+            return
+        end
+
+        if Phase == 1 then
+            local NewY, Finished = MoveTowardY(Position.Y, HighY, dt)
+            MoveBoat(Vector3.new(Position.X, NewY, Position.Z), Direction)
+            if Finished then
+                Phase = 2
+                HighStartPosition = Vector3.new(Position.X, HighY, Position.Z)
+            end
+            return
+        end
+
+        if Phase == 2 then
+            local NewPosition = Position + Direction * Config.Speed * dt
+            NewPosition = Vector3.new(NewPosition.X, HighY, NewPosition.Z)
+            MoveBoat(NewPosition, Direction)
+
+            if HighStartPosition and (Vector3.new(NewPosition.X, 0, NewPosition.Z) - Vector3.new(HighStartPosition.X, 0, HighStartPosition.Z)).Magnitude >= Config.HighDistance then
+                Phase = 3
+            end
+            return
+        end
+
+        if Phase == 3 then
+            local TargetY = StartY + Config.Height
+            local NewY, Finished = MoveTowardY(Position.Y, TargetY, dt)
+            local NewPosition = Position + Direction * Config.Speed * dt
+            NewPosition = Vector3.new(NewPosition.X, NewY, NewPosition.Z)
+            MoveBoat(NewPosition, Direction)
+            if Finished then
+                Phase = 4
+            end
+        end
+    end)
 end
-
-
---------------------------------------------------
--- RESPAWN
---------------------------------------------------
-
-Player.CharacterAdded:Connect(
-    function()
-
-        task.wait(0.5)
-
-        Boat = nil
-        Seat = nil
-
-        ResetFlight()
-
-        if Config.Enabled then
-            SitBoat()
-        end
-    end
-)
-
-
---------------------------------------------------
--- AUTO FIND
---------------------------------------------------
-
-task.spawn(function()
-
-    while Config.Enabled do
-
-        if not Boat
-            or not Boat.Parent then
-
-            SitBoat()
-        end
-
-        task.wait(0.2)
-    end
-end)
-
-
---------------------------------------------------
--- START
---------------------------------------------------
 
 StartBoatFly()
 
 task.spawn(function()
-
-    task.wait(0.2)
-
-    if Config.Enabled then
-        SitBoat()
+    while task.wait(0.5) do
+        if Config.Enabled and (not Boat or not Boat.Parent) then
+            SitBoat(false)
+        end
     end
 end)
 
-print("==============================")
-print("Smooth Boat Fly Loaded")
-print("Sit -> Immediate Flight")
-print("Jump -> Pause")
-print("Auto Dodge -> 300 studs -> back to 20 studs")
-print("Sit Again -> Resume")
-print("==============================")
+task.spawn(function()
+    task.wait(0.5)
+    if Config.Enabled then
+        SitBoat(true)
+    end
+end)
+
+Player.CharacterAdded:Connect(function()
+    task.wait(0.7)
+    Boat, Seat = nil, nil
+    ResetFlight()
+    if Config.Enabled then
+        SitBoat(true)
+    end
+end)
+
+print("Boat Fly FIXED: Find Boat + Auto Fly + Auto Dodge")
+
+
+print("Banana Cat + Boat Fly FIXED loaded")
