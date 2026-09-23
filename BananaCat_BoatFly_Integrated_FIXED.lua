@@ -519,15 +519,15 @@ getgenv().caiconcac = toTarget;
 
 getgenv().BoatFly = getgenv().BoatFly or {
     Enabled = true,
-    Speed = 150,
-    Height = 15,
+    Speed = 300,
+    Height = 50,
     HighHeight = 1000,
     HighDistance = 250,
     HighHoldTime = 5,
     DodgeEnabled = true,
-    DodgeDistance = 180,
-    DodgeRadius = 12,
-    DodgeCooldown = 2,
+    DodgeDistance = 500,
+    DodgeRadius = 40,
+    DodgeCooldown = 0.08,
     VerticalSpeed = 120,
     Direction = Vector3.new(-0.99102227, 0, -0.13369414),
     AutoFindBoat = true,
@@ -689,6 +689,9 @@ local function DetectObstacle(Position, Direction)
     if not Config.DodgeEnabled then
         return false
     end
+
+    -- Do not throttle detection heavily: the old 2-second cooldown could let
+    -- fast/small obstacles appear between checks. Only a tiny debounce remains.
     if os.clock() - LastDodge < Config.DodgeCooldown then
         return false
     end
@@ -698,31 +701,44 @@ local function DetectObstacle(Position, Direction)
     Params.FilterDescendantsInstances = {Boat, Player.Character}
     Params.IgnoreWater = true
 
-    -- Check several heights and a wider sphere so rocks, islands and NPC/monster
-    -- hitboxes are detected even when their center is above/below the boat.
-    local Heights = {0, 6, 14, 24, 40}
-    for _, OffsetY in ipairs(Heights) do
-        local Origin = Position + Vector3.new(0, OffsetY, 0)
-        local Result = Workspace:Spherecast(
-            Origin,
-            Config.DodgeRadius,
-            Direction * Config.DodgeDistance,
-            Params
-        )
-        if Result and IsValidObstaclePart(Result.Instance) then
-            LastDodge = os.clock()
-            return true
+    -- Check a 500-stud forward corridor at several heights.  The spherecasts
+    -- overlap so narrow rocks, terrain edges, ships and NPC hitboxes are much
+    -- less likely to slip through between two rays.
+    local Forward = Direction.Unit
+    local Right = Vector3.new(-Forward.Z, 0, Forward.X)
+    local Length = Config.DodgeDistance
+    local Radius = Config.DodgeRadius
+    local HeightOffsets = {-35, -20, -5, 10, 25, 40, 60, 80}
+    local SideOffsets = {-35, -18, 0, 18, 35}
+
+    for _, Y in ipairs(HeightOffsets) do
+        for _, SideAmount in ipairs(SideOffsets) do
+            local Origin = Position + Vector3.new(0, Y, 0) + Right * SideAmount
+            local Result = Workspace:Spherecast(Origin, Radius, Forward * Length, Params)
+            if Result and IsValidObstaclePart(Result.Instance) then
+                LastDodge = os.clock()
+                return true
+            end
         end
     end
 
-    -- Extra rays slightly to either side catch narrow rocks/parts missed by the sphere.
-    local Side = Vector3.new(-Direction.Z, 0, Direction.X)
-    for _, Sign in ipairs({-1, 1}) do
-        local Origin = Position + Side * (Config.DodgeRadius * Sign)
-        local Result = Workspace:Raycast(Origin, Direction * Config.DodgeDistance, Params)
-        if Result and IsValidObstaclePart(Result.Instance) then
-            LastDodge = os.clock()
-            return true
+    -- Also query the whole forward corridor. This catches large/irregular
+    -- objects whose geometry can be missed by a single cast.
+    local BoxCenter = Position + Forward * (Length * 0.5)
+    local BoxSize = Vector3.new(90, 180, Length)
+    local BoxCFrame = CFrame.lookAt(BoxCenter, BoxCenter + Forward, Vector3.yAxis)
+    local Parts = Workspace:GetPartBoundsInBox(BoxCFrame, BoxSize, Params)
+    for _, Part in ipairs(Parts) do
+        if IsValidObstaclePart(Part) then
+            local Relative = Part.Position - Position
+            local ForwardDistance = Relative:Dot(Forward)
+            local SideDistance = math.abs(Relative:Dot(Right))
+            local VerticalDistance = math.abs(Relative.Y)
+            if ForwardDistance >= 0 and ForwardDistance <= Length
+                and SideDistance <= 60 and VerticalDistance <= 100 then
+                LastDodge = os.clock()
+                return true
+            end
         end
     end
 
@@ -797,7 +813,7 @@ end
 if z.TabBoatFly then
     z.TabBoatFly:AddParagraph({
         Title = "Boat Fly",
-        Content = "Find Boat → ngồi vào thuyền → né vật cản bằng cách bay lên 1000 studs, giữ độ cao 5 giây rồi hạ xuống."
+        Content = "Find Boat → ngồi vào thuyền → né vật cản trong phạm vi 500 studs bằng cách bay lên 1000 studs, giữ độ cao 5 giây rồi hạ xuống."
     })
 
     z.TabBoatFly:AddButton({
@@ -899,7 +915,7 @@ local function StartBoatFly()
         end
 
         if Phase == 1 then
-            -- Rise straight up to the configured high altitude (default +300).
+            -- Rise straight up to the configured high altitude (default +1000).
             local NewY, Finished = MoveTowardY(Position.Y, HighY, dt)
             MoveBoat(Vector3.new(Position.X, NewY, Position.Z), Direction)
             if Finished then
